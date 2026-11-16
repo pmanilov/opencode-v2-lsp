@@ -2,18 +2,20 @@
 
 A local plugin that brings the OpenCode V1-style `lsp` tool and post-edit error diagnostics to OpenCode V2. OpenCode loads the TypeScript source directly, without a build step.
 
+This repository is the [pmanilov/opencode-v2-lsp fork](https://github.com/pmanilov/opencode-v2-lsp) of [christensenjairus/opencode-v2-lsp-support](https://github.com/christensenjairus/opencode-v2-lsp-support), originally by Jairus Christensen. The runtime plugin ID and package name remain `opencode-v2-lsp-support` for compatibility.
+
 ## Install
 
 1. Clone the repository somewhere you will keep it:
 
    ```sh
-   git clone https://github.com/christensenjairus/opencode-v2-lsp-support.git "$HOME/opencode-v2-lsp-support"
+   git clone https://github.com/pmanilov/opencode-v2-lsp.git "$HOME/opencode-v2-lsp"
    ```
 
 2. Install the pinned Cargo manifest parser:
 
    ```sh
-   npm ci --prefix "$HOME/opencode-v2-lsp-support" --ignore-scripts
+   npm ci --prefix "$HOME/opencode-v2-lsp" --ignore-scripts
    ```
 
 3. Add the clone's **absolute directory path** to `plugins` in your global `~/.config/opencode/opencode.json(c)` or your project's `opencode.json(c)`. Replace `/home/you` with your actual home directory, and preserve your other config entries:
@@ -21,7 +23,7 @@ A local plugin that brings the OpenCode V1-style `lsp` tool and post-edit error 
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
-     "plugins": ["/home/you/opencode-v2-lsp-support"],
+     "plugins": ["/home/you/opencode-v2-lsp"],
      "lsp": {
        "pyright": {
          "command": ["pyright-langserver", "--stdio"],
@@ -36,7 +38,7 @@ A local plugin that brings the OpenCode V1-style `lsp` tool and post-edit error 
 
 The repo root is the plugin directory: `index.ts` is the entrypoint and `src/` contains its implementation. OpenCode loads both directly. `package.json` declares the source entrypoint, the pinned `smol-toml` dependency, and a test command. It is marked private to prevent accidental npm publication. The parser loads only for Rust root detection, so a missing install does not disable other languages.
 
-For project-local automatic discovery, clone the repository into `.opencode/plugins/opencode-v2-lsp-support` within your project and omit the `plugins` entry. Run `npm ci --ignore-scripts` in that clone. You still need the `lsp` server configuration.
+For project-local automatic discovery, clone the repository into `.opencode/plugins/opencode-v2-lsp` within your project and omit the `plugins` entry. Run `npm ci --ignore-scripts` in that clone. You still need the `lsp` server configuration.
 
 See [examples/opencode.jsonc](examples/opencode.jsonc) for portable Python, TypeScript/JavaScript, Go, shell, YAML, and Rust commands. Keep only the servers you have installed. Loading the plugin does not install or download language servers.
 
@@ -81,7 +83,7 @@ Optional settings use OpenCode's object-form plugin entry:
 {
   "plugins": [
     {
-      "package": "/home/you/opencode-v2-lsp-support",
+      "package": "/home/you/opencode-v2-lsp",
       "options": {
         "diagnostics": true,
         "diagnosticsTimeoutMs": 5000,
@@ -122,3 +124,7 @@ No real language servers are needed. The suite uses a fake stdio LSP server and 
 Run `git pull --ff-only` and `npm ci --ignore-scripts` in your clone, then use `/reload` to update. To uninstall, remove its `plugins` entry or its automatically discovered project-local clone, then reload. Language-server installations and your `lsp` configuration remain yours to manage.
 
 OpenCode's [V2 plugin documentation](https://opencode.ai/v2/docs/build/plugins) describes local directory loading and the plugin API.
+
+## License
+
+Licensed under the [MIT License](LICENSE). Original copyright: © 2026 Jairus Christensen.
