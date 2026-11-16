@@ -71,9 +71,9 @@ The plugin reads the V1-shaped `lsp` map from OpenCode config files. Each server
 
 Known V1 server IDs have default extensions and root rules in [src/catalog.ts](src/catalog.ts). For example, `pyright` selects the nearest Python project marker, `typescript` selects the nearest JavaScript lockfile and skips Deno projects, and `rust` detects Cargo workspaces. Custom IDs must supply extensions and run at the plugin's project directory. Recognizing an ID does **not** supply an executable command: every enabled server must have one configured.
 
-Cargo workspace detection rejects malformed or unreadable manifests instead of guessing a root. Fix the manifest before retrying Rust navigation. If `smol-toml` is missing, run `npm ci --ignore-scripts` in the plugin directory.
+Cargo workspace detection rejects malformed, unreadable, outside-project, nonregular, or larger-than-1-MiB manifests instead of guessing a root. Fix the manifest before retrying Rust navigation. If `smol-toml` is missing, run `npm ci --ignore-scripts` in the plugin directory.
 
-The config reader loads global files, `OPENCODE_CONFIG`, ancestor project files, ancestor `.opencode` files, then `OPENCODE_CONFIG_CONTENT`. It supports JSONC, `{env:VAR}` and `{file:path}` substitution, project-config disable flags, and deep merges of server objects; arrays are replaced. Plugin options take final precedence. This is a local config reader, not access to OpenCode's merged configuration; remote or externally supplied config is not automatically discovered.
+The config reader loads global files, `OPENCODE_CONFIG`, ancestor project files, ancestor `.opencode` files, `OPENCODE_CONFIG_CONTENT`, then platform system files (`/etc/opencode` on Linux, `/Library/Application Support/opencode` on macOS, `%ProgramData%\opencode` on Windows). It supports JSONC, `{env:VAR}` and `{file:path}` substitution, project-config disable flags, and deep merges of server objects; arrays are replaced. Environment values retry with JSON escaping when raw substitution is invalid; unavailable file references become empty strings with a warning. Plugin options take final precedence. This is a local config reader, not access to OpenCode's merged configuration; MDM preferences, integration documents, and remote config are not automatically discovered.
 
 Optional settings use OpenCode's object-form plugin entry:
 
@@ -94,18 +94,21 @@ Optional settings use OpenCode's object-form plugin entry:
 }
 ```
 
-The values shown are the defaults. `diagnostics: false` disables post-edit reporting but leaves navigation available. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
+The values shown are the defaults. `diagnostics: false` disables post-edit reporting but still synchronizes edits for navigation. Unchanged contents are not resent to already-synchronized servers. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
 
 ## Limitations and trust
 
-- Targets the OpenCode V2 plugin API (`ctx.tool.transform` and `ctx.tool.hook("execute.after", ...)`), not V1. The source was extracted from a plugin used with OpenCode **v2.0.23**; other versions need verification.
+- Targets the OpenCode V2 plugin API (`ctx.tool.transform` and `ctx.tool.hook("execute.after", ...)`), not V1. Patch tracking uses OpenCode **2.3.0**'s `result.metadata.files` contract. Loading and hover have been smoke-checked in 2.3.0 with a fake stdio server; real language servers still require project-specific checks.
 - Language servers must already be installed and support stdio. No automatic installation, TCP transport, or full editor functionality is provided.
 - Only errors are appended to tool results; warnings and hints are omitted. Missing diagnostic severity is treated as an error. Reports are capped at 20 errors per file and five other files; workspace symbol results are capped at 20.
+- Diagnostic retention is bounded per server to 128 recently received URI reports, each at most 256 KiB and 1,024 diagnostics. Messages are limited to 16 KiB and source/string-code fields to 1 KiB. A visible notice accounts for omitted diagnostics or shortened text; older URI reports may be evicted.
+- Call-hierarchy follow-ups run at most four requests concurrently per server. More than 100 prepared targets fails with an explicit error rather than issuing an unbounded request fan-out.
 - Diagnostics are best-effort. A silent or failed server leaves the edit result unchanged; a navigation request explains a startup failure. A server that fails to start stays disabled for that plugin instance until it reloads.
-- Malformed protocol messages disable the server until the plugin reloads. Headers are limited to 8 KiB and bodies to 16 MiB. Valid replies above this limit also disable the server.
+- Malformed protocol messages disable the server until the plugin reloads. Headers are limited to 8 KiB and bodies to 16 MiB. Outbound writes honor stdio backpressure; exceeding the bounded 256-frame / roughly 16-MiB outbound buffer also disables the server.
 - Cold-start initialization and navigation warm-up can take longer than the configured diagnostics wait.
 - Save notifications require an explicit `textDocumentSync.save` capability. Legacy numeric-only sync capabilities do not receive them; servers that rely on save-only checks must advertise save support.
 - The plugin checks which document contents it sends; it does **not** sandbox the server process or stop a server from scanning dependencies outside the project. Servers run with the OpenCode service's OS privileges and inherited environment. Only load trusted code and configure trusted commands; debug output may include server messages and paths.
+- Diagnostic wrapper delimiters and file attributes are escaped. Server text, including hover documentation, remains untrusted data; escaping does not eliminate prompt injection.
 
 ## Test
 

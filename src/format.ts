@@ -5,6 +5,7 @@ import { isRecord } from "./config.ts"
 
 const MAX_ERRORS_PER_FILE = 20
 const MAX_WORKSPACE_SYMBOLS = 20
+const DIAGNOSTIC_ESCAPES: Readonly<Record<string, string>> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }
 
 const SEVERITY: Record<number, string> = { 1: "ERROR", 2: "WARN", 3: "INFO", 4: "HINT" }
 
@@ -27,11 +28,15 @@ export function diagnosticsReport(file: string, diagnostics: Diagnostic[]): stri
   const lines = errors.slice(0, MAX_ERRORS_PER_FILE).map((diagnostic) => {
     const severity = SEVERITY[diagnostic.severity ?? 1] ?? "ERROR"
     const { line, character } = start(diagnostic.range)
-    return `${severity} [${line}:${character}] ${diagnostic.message}`
+    return `${severity} [${line}:${character}] ${escapeDiagnostic(diagnostic.message)}`
   })
   const more = errors.length - MAX_ERRORS_PER_FILE
   if (more > 0) lines.push(`... and ${more} more`)
-  return `<diagnostics file="${file}">\n${lines.join("\n")}\n</diagnostics>`
+  return `<diagnostics file="${escapeDiagnostic(file)}">\n${lines.join("\n")}\n</diagnostics>`
+}
+
+function escapeDiagnostic(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => DIAGNOSTIC_ESCAPES[char] ?? char)
 }
 
 export function displayPath(uriOrPath: string, root: string): string {

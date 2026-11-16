@@ -1,5 +1,6 @@
 import { createRequire } from "node:module"
-import { access, lstat, open, readFile, readlink, realpath } from "node:fs/promises"
+import { constants } from "node:fs"
+import { access, lstat, open, readlink, realpath } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
@@ -17,6 +18,66 @@ const PULL_ATTEMPTS = 3
 const WARMUP_TIMEOUT_MS = 6_000
 // Codes for "still loading" and "cancelled because the document changed".
 const TRANSIENT_CODES = new Set([-32800, -32801, -32802])
+// Manifest reads stop at 1 MiB even if the opened file grows while being read.
+const MAX_MANIFEST_BYTES = 1024 * 1024
+// Per server: retain the 128 most recently received URI reports, each at most
+// 256 KiB / 1024 diagnostics. Prefer errors over warnings over informational
+// reports when space runs out; an explicit diagnostic accounts for omissions.
+const MAX_REPORT_URIS = 128
+const MAX_REPORT_BYTES = 256 * 1024
+const MAX_REPORT_DIAGNOSTICS = 1024
+const MAX_MESSAGE_BYTES = 16 * 1024
+const MAX_LABEL_BYTES = 1024
+const MAX_URI_BYTES = 8192
+
+/** Bound UTF-8 text without cutting a multibyte character. */
+function boundedText(text: string, limit: number): string {
+  if (Buffer.byteLength(text) <= limit) return text
+  const bytes = Buffer.from(text.slice(0, limit))
+  let end = limit - 3 // Reserve the ellipsis.
+  while ((bytes[end]! & 0xc0) === 0x80) end--
+  return `${bytes.subarray(0, end).toString("utf8")}…`
+}
+
+function boundedDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
+  const retained: Diagnostic[] = []
+  let bytes = 2
+  let shortened = 0
+  // Stable severity order means a flood of hints cannot displace errors.
+  for (const severity of [1, 2, 3, 4, undefined]) {
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.severity !== severity) continue
+      if (retained.length >= MAX_REPORT_DIAGNOSTICS - 1) break
+      const message = boundedText(diagnostic.message, MAX_MESSAGE_BYTES)
+      const source = diagnostic.source === undefined ? undefined : boundedText(diagnostic.source, MAX_LABEL_BYTES)
+      const code = typeof diagnostic.code === "string" ? boundedText(diagnostic.code, MAX_LABEL_BYTES) : diagnostic.code
+      // Copy only protocol fields: unknown server extensions must not retain
+      // arbitrarily large object graphs alongside the bounded message.
+      const item: Diagnostic = {
+        range: {
+          start: { line: diagnostic.range.start.line, character: diagnostic.range.start.character },
+          end: { line: diagnostic.range.end.line, character: diagnostic.range.end.character },
+        },
+        severity, message, source, code,
+      }
+      const size = Buffer.byteLength(JSON.stringify(item)) + 1
+      if (bytes + size > MAX_REPORT_BYTES - 512) continue
+      retained.push(item)
+      bytes += size
+      if (message !== diagnostic.message || source !== diagnostic.source || code !== diagnostic.code) shortened++
+    }
+  }
+  const omitted = diagnostics.length - retained.length
+  if (omitted || shortened) {
+    retained.unshift({
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      severity: diagnostics.some((item) => item.severity === 1 || item.severity === undefined) ? 1 : 2,
+      source: "opencode-lsp",
+      message: `Diagnostic report limited: ${omitted} diagnostics omitted; ${shortened} retained diagnostics had text shortened.`,
+    })
+  }
+  return retained
+}
 
 interface Target {
   /** One client per server and root, as OpenCode 1 ran them. */
@@ -30,7 +91,7 @@ interface Entry {
   starting?: Promise<LspClient>
   broken?: string
   warmed?: boolean
-  readonly opened: Set<string>
+  readonly opened: Map<string, { version: number; sentAt: number }>
 }
 
 interface Synced {
@@ -71,19 +132,34 @@ export async function insideProject(root: string, file: string): Promise<boolean
  * outside contents past the check. Elsewhere the opened inode must still sit at
  * the resolved path, which a racing swap of a parent directory could defeat.
  */
-async function readInside(root: string, file: string): Promise<string> {
+async function readInside(root: string, file: string, limit?: number): Promise<string> {
   const outside = new Error(`${file} is outside the project directory ${root}.`)
   if (!within(root, file)) throw outside
-  const handle = await open(file, "r")
+  // A FIFO must not block open before we can reject it with fstat.
+  const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK)
   try {
+    const held = await handle.stat()
+    if (!held.isFile()) throw new Error(`${file} is not a regular file.`)
     const opened = await readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined)
     const real = opened ?? (await realpath(file))
     if (!within(await realpath(root).catch(() => root), real)) throw outside
     if (opened === undefined) {
-      const [held, current] = await Promise.all([handle.stat(), lstat(real)])
+      const current = await lstat(real)
       if (current.dev !== held.dev || current.ino !== held.ino) throw outside
     }
-    return await handle.readFile("utf8")
+    if (limit === undefined) return await handle.readFile("utf8")
+    if (held.size > limit) throw new Error(`${file} exceeds the ${limit}-byte read limit.`)
+    const chunks: Buffer[] = []
+    let total = 0
+    for (;;) {
+      // Read one extra byte to distinguish an exact-limit file from a growing one.
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit - total + 1))
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null)
+      if (bytesRead === 0) return Buffer.concat(chunks, total).toString("utf8")
+      total += bytesRead
+      if (total > limit) throw new Error(`${file} exceeds the ${limit}-byte read limit.`)
+      chunks.push(chunk.subarray(0, bytesRead))
+    }
   } finally {
     await handle.close()
   }
@@ -102,7 +178,7 @@ export function within(root: string, file: string): boolean {
 
 /** The directory a server runs in for this file, or undefined when the server does not apply to it. */
 export async function serverRoot(id: string, file: string, project: string): Promise<string | undefined> {
-  const rule = BUILTIN_ROOTS[id]
+  const rule = Object.hasOwn(BUILTIN_ROOTS, id) ? BUILTIN_ROOTS[id] : undefined
   if (!rule) return project
   if (rule.exclude && (await nearest(file, project, rule.exclude))) return undefined
   const found = await nearest(file, project, rule.markers)
@@ -126,7 +202,7 @@ async function cargoWorkspace(crate: string, project: string): Promise<string> {
   for (let dir = crate; ; dir = dirname(dir)) {
     let manifest: string | undefined
     try {
-      manifest = await readFile(join(dir, "Cargo.toml"), "utf8")
+      manifest = await readInside(project, join(dir, "Cargo.toml"), MAX_MANIFEST_BYTES)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
     }
@@ -140,6 +216,8 @@ export class LspManager {
   readonly #root: string
   readonly #entries = new Map<string, Entry>()
   readonly #versions = new Map<string, number>()
+  // One content copy per open URI, shared by all servers. Close releases it.
+  readonly #contents = new Map<string, string>()
   readonly #deleted = new Set<string>()
   readonly #published = new Map<string, Map<string, Published>>()
   readonly #listeners = new Map<string, Set<() => void>>()
@@ -201,11 +279,13 @@ export class LspManager {
     const uri = pathToFileURL(file).href
     return this.#serialize(uri, async () => {
       this.#deleted.add(uri)
+      this.#contents.delete(uri)
       for (const [key, entry] of this.#entries) {
         this.#published.get(key)?.delete(uri)
         if (!entry.opened.delete(uri)) continue
         if (entry.client?.running) entry.client.notify("textDocument/didClose", { textDocument: { uri } })
       }
+      for (const key of this.#entries.keys()) this.#notify(key)
     })
   }
 
@@ -214,34 +294,49 @@ export class LspManager {
     // OpenCode 1 asked before touching files outside the project; plugins cannot ask, so they are never sent.
     const text = await readInside(this.#root, file)
     signal?.throwIfAborted()
-    const ready: { target: Target; client: LspClient }[] = []
-    for (const target of await this.#targets(file)) {
-      signal?.throwIfAborted()
-      // Initialization is shared; cancelling one tool must not break another caller's server.
-      const client = await abortable(this.#client(target).catch(() => undefined), signal)
-      signal?.throwIfAborted()
-      if (client) ready.push({ target, client })
-    }
+    // Initialization is shared and independent servers start concurrently.
+    const targets = await this.#targets(file)
+    signal?.throwIfAborted()
+    const started = await abortable(Promise.all(targets.map(async (target) => {
+      const client = await this.#client(target).catch(() => undefined)
+      return client ? { target, client } : undefined
+    })), signal)
+    const ready = started.filter((item): item is { target: Target; client: LspClient } => item !== undefined)
     signal?.throwIfAborted()
     if (this.#closed) throw new Error("LSP is shut down")
     if (ready.length === 0) return []
     // Commit the version only after startup finishes, then notify every client without
     // yielding. A cancelled startup must not make their last actual reports stale.
-    const version = (this.#versions.get(uri) ?? 0) + 1
-    this.#versions.set(uri, version)
+    const changed = this.#contents.get(uri) !== text
+    const version = (this.#versions.get(uri) ?? 0) + (changed ? 1 : 0)
+    if (changed) {
+      this.#versions.set(uri, version)
+      this.#contents.set(uri, text)
+      // Unversioned reports cannot prove they describe the new contents.
+      for (const [key, published] of this.#published) {
+        published.delete(uri)
+        this.#notify(key)
+      }
+    }
     this.#deleted.delete(uri)
     const synced: Synced[] = []
     for (const { target, client } of ready) {
       const entry = this.#entries.get(target.key)!
+      const previous = entry.opened.get(uri)
+      if (previous?.version === version) {
+        synced.push({ client, version, sentAt: previous.sentAt })
+        continue
+      }
+      this.#published.get(target.key)?.delete(uri)
       const sentAt = Date.now()
-      if (entry.opened.has(uri)) {
+      if (previous) {
         client.notify("textDocument/didChange", { textDocument: { uri, version }, contentChanges: [{ text }] })
       } else {
         client.notify("textDocument/didOpen", {
           textDocument: { uri, languageId: languageIdForExtension(extensionKey(file)), version, text },
         })
-        entry.opened.add(uri)
       }
+      entry.opened.set(uri, { version, sentAt })
       // Edit tools write to disk, and some servers (rust-analyzer, for one) only re-check on save.
       const save = client.capabilities.textDocumentSync?.save
       if (save === true || (save && typeof save === "object")) {
@@ -268,11 +363,12 @@ export class LspManager {
     // Reports from before this file's contents reached the server describe older contents.
     const reports = await Promise.all(synced.map(({ client, version, sentAt }) => this.#collect(client, uri, version, sentAt, timeoutMs, signal)))
     signal?.throwIfAborted()
-    const reported = reports.filter((report): report is Diagnostic[] => report !== undefined)
+    const reported = reports.filter((report, index): report is Diagnostic[] =>
+      report !== undefined && report === this.#fresh(synced[index]!.client.id, uri)?.diagnostics)
     const others = new Map<string, Diagnostic[]>()
     for (const { client, sentAt } of synced) {
       for (const [other, published] of this.#published.get(client.id) ?? []) {
-        if (other === uri || published.at < sentAt) continue
+        if (other === uri || !this.#fresh(client.id, other, sentAt)) continue
         others.set(other, [...(others.get(other) ?? []), ...published.diagnostics])
       }
     }
@@ -301,9 +397,9 @@ export class LspManager {
           if (sent === undefined || this.#versions.get(uri) !== sent) continue
           if (report.kind === "full") {
             this.#store(client.id, uri, report.items, sent)
-            return report.items
+            return this.#fresh(client.id, uri)?.diagnostics
           }
-          return this.#published.get(client.id)?.get(uri)?.diagnostics
+          return this.#fresh(client.id, uri)?.diagnostics
         }
       } catch (error) {
         signal?.throwIfAborted()
@@ -320,8 +416,8 @@ export class LspManager {
     return new Promise((resolve, reject) => {
       let settle: ReturnType<typeof setTimeout> | undefined
       const current = () => {
-        const published = this.#published.get(serverID)?.get(uri)
-        if (!published || published.at < since) return undefined
+        const published = this.#fresh(serverID, uri, since)
+        if (!published) return undefined
         if (published.version !== undefined && published.version < version) return undefined
         return published
       }
@@ -390,7 +486,7 @@ export class LspManager {
     if (this.#closed) throw new Error("LSP is shut down")
     let entry = this.#entries.get(key)
     if (!entry) {
-      entry = { opened: new Set() }
+      entry = { opened: new Map() }
       this.#entries.set(key, entry)
     }
     if (entry.client?.failure) entry.broken = entry.client.failure.message
@@ -439,14 +535,26 @@ export class LspManager {
   }
 
   #store(serverID: string, uri: string, diagnostics: Diagnostic[], version: number | undefined): void {
-    if (this.#deleted.has(uri)) return
+    if (this.#closed || this.#deleted.has(uri) || Buffer.byteLength(uri) > MAX_URI_BYTES) return
     const published = this.#published.get(serverID) ?? new Map<string, Published>()
     // A late report for an older version describes contents that are gone.
     const latest = this.#versions.get(uri) ?? published.get(uri)?.version
     if (version !== undefined && latest !== undefined && version < latest) return
-    published.set(uri, { diagnostics, at: Date.now(), version })
+    // Refresh insertion order, evicting the least recently received report first.
+    published.delete(uri)
+    published.set(uri, { diagnostics: boundedDiagnostics(diagnostics), at: Date.now(), version })
+    if (published.size > MAX_REPORT_URIS) published.delete(published.keys().next().value!)
     this.#published.set(serverID, published)
     this.#notify(serverID)
+  }
+
+  #fresh(serverID: string, uri: string, since = 0): Published | undefined {
+    if (this.#deleted.has(uri)) return undefined
+    const published = this.#published.get(serverID)?.get(uri)
+    if (!published || published.at < since) return undefined
+    const version = this.#versions.get(uri)
+    if (version !== undefined && published.version !== undefined && published.version !== version) return undefined
+    return published
   }
 
   #notify(serverID: string): void {
@@ -461,6 +569,10 @@ export class LspManager {
     this.#closed = true
     const entries = [...this.#entries.values()]
     this.#entries.clear()
+    this.#contents.clear()
+    this.#published.clear()
+    this.#versions.clear()
+    this.#deleted.clear()
     await Promise.all(
       entries.map(async (entry) => {
         const client = entry.client ?? (await entry.starting?.catch(() => undefined))

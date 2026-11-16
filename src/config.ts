@@ -53,7 +53,16 @@ export function configDocuments(directory: string, env: NodeJS.ProcessEnv): Reco
     if (document) documents.push(document)
   }
   const global = env.OPENCODE_CONFIG_DIR ?? join(env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")
-  for (const name of NAMES) push(readDocument(join(global, name)))
+  const system = process.platform === "darwin"
+    ? "/Library/Application Support/opencode"
+    : process.platform === "win32"
+      ? join(env.ProgramData || env.PROGRAMDATA || "C:\\ProgramData", "opencode")
+      : "/etc/opencode"
+  const systemFiles = new Set(NAMES.map((name) => canonical(join(system, name))))
+  for (const name of NAMES) {
+    const file = join(global, name)
+    if (!systemFiles.has(canonical(file))) push(readDocument(file))
+  }
   if (env.OPENCODE_CONFIG) push(readDocument(resolve(env.OPENCODE_CONFIG)))
 
   const projectDisabled = truthy(env.OPENCODE_CONFIG_PROJECT_DISABLE ?? env.OPENCODE_DISABLE_PROJECT_CONFIG)
@@ -69,16 +78,18 @@ export function configDocuments(directory: string, env: NodeJS.ProcessEnv): Reco
     for (const ancestor of ancestors) {
       for (const name of NAMES) {
         const file = join(ancestor, name)
-        if (!globalFiles.has(canonical(file))) push(readDocument(file))
+        if (!globalFiles.has(canonical(file)) && !systemFiles.has(canonical(file))) push(readDocument(file))
       }
     }
     for (const ancestor of ancestors) {
       const project = join(ancestor, ".opencode")
-      if (canonical(project) === canonical(global)) continue
+      if (canonical(project) === canonical(global) || canonical(project) === canonical(system)) continue
       for (const name of NAMES) push(readDocument(join(project, name)))
     }
   }
   if (env.OPENCODE_CONFIG_CONTENT) push(parseDocument(env.OPENCODE_CONFIG_CONTENT, "OPENCODE_CONFIG_CONTENT", directory, env))
+  // Host-managed MDM/integration settings are not exposed to plugins.
+  for (const name of NAMES) push(readDocument(join(system, name)))
   return documents
 
   function readDocument(path: string): Record<string, unknown> | undefined {
@@ -89,7 +100,13 @@ export function configDocuments(directory: string, env: NodeJS.ProcessEnv): Reco
 
 function parseDocument(text: string, source: string, dir: string, env: NodeJS.ProcessEnv): Record<string, unknown> | undefined {
   try {
-    const parsed = parseJsonc(substitute(text, dir, env))
+    let parsed: unknown
+    try {
+      parsed = parseJsonc(substitute(text, dir, env))
+    } catch {
+      // Permit raw JSON fragments first, then retry string-safe environment values.
+      parsed = parseJsonc(substituteText(text, dir, env, true))
+    }
     return isRecord(parsed) ? parsed : undefined
   } catch (error) {
     console.error(`[lsp] cannot parse ${source}: ${error instanceof Error ? error.message : String(error)}`)
@@ -101,16 +118,28 @@ function parseDocument(text: string, source: string, dir: string, env: NodeJS.Pr
  * OpenCode 2's substitution, applied to the raw text before parsing: `{env:VAR}`
  * becomes the variable or nothing, and `{file:path}` becomes the trimmed file,
  * escaped for a JSON string, relative to `dir` unless absolute or `~/`. File
- * tokens on `//` comment lines stay as they are; a missing file fails the document.
+ * tokens on `//` comment lines stay as they are; unreadable files become empty with a warning.
  */
 export function substitute(text: string, dir: string, env: NodeJS.ProcessEnv): string {
+  return substituteText(text, dir, env, false)
+}
+
+function substituteText(text: string, dir: string, env: NodeJS.ProcessEnv, escapeEnv: boolean): string {
   return text
-    .replace(/\{env:([^}]+)\}/g, (_, name: string) => env[name] || "")
+    .replace(/\{env:([^}]+)\}/g, (_, name: string) => {
+      const value = Object.hasOwn(env, name) ? env[name] || "" : ""
+      return escapeEnv ? JSON.stringify(value).slice(1, -1) : value
+    })
     .replace(/\{file:[^}]+\}/g, (token: string, offset: number, whole: string) => {
       if (whole.slice(whole.lastIndexOf("\n", offset - 1) + 1, offset).trimStart().startsWith("//")) return token
       const path = token.slice("{file:".length, -1)
       const file = resolve(dir, path.startsWith("~/") ? join(homedir(), path.slice(2)) : path)
-      return JSON.stringify(readFileSync(file, "utf8").trim()).slice(1, -1)
+      try {
+        return JSON.stringify(readFileSync(file, "utf8").trim()).slice(1, -1)
+      } catch (error) {
+        console.error(`[lsp] cannot read substitution file ${file}: ${error instanceof Error ? error.message : String(error)}`)
+        return ""
+      }
     })
 }
 
@@ -124,14 +153,24 @@ export function mergeLsp(previous: unknown, next: unknown): unknown {
   if (next === true) return isRecord(previous) ? previous : {}
   if (!isRecord(next)) return previous
   const merged: Record<string, unknown> = isRecord(previous) ? { ...previous } : {}
-  for (const [id, entry] of Object.entries(next)) merged[id] = mergeDeep(merged[id], entry)
+  for (const [id, entry] of Object.entries(next)) {
+    Object.defineProperty(merged, id, {
+      value: mergeDeep(Object.hasOwn(merged, id) ? merged[id] : undefined, entry),
+      enumerable: true, configurable: true, writable: true,
+    })
+  }
   return merged
 }
 
 function mergeDeep(previous: unknown, next: unknown): unknown {
   if (!isRecord(previous) || !isRecord(next)) return next
   const merged: Record<string, unknown> = { ...previous }
-  for (const [key, value] of Object.entries(next)) merged[key] = mergeDeep(merged[key], value)
+  for (const [key, value] of Object.entries(next)) {
+    Object.defineProperty(merged, key, {
+      value: mergeDeep(Object.hasOwn(merged, key) ? merged[key] : undefined, value),
+      enumerable: true, configurable: true, writable: true,
+    })
+  }
   return merged
 }
 
@@ -146,7 +185,8 @@ function resolveServers(lsp: unknown, debug: boolean): ServerConfig[] {
       continue
     }
     const declared = strings(entry.extensions)
-    const extensions = [...new Set((declared.length ? declared : (BUILTIN_EXTENSIONS[id] ?? [])).map((item) => item.trim().toLowerCase()))].filter(Boolean)
+    const builtin = Object.hasOwn(BUILTIN_EXTENSIONS, id) ? BUILTIN_EXTENSIONS[id] : []
+    const extensions = [...new Set((declared.length ? declared : builtin).map((item) => item.trim().toLowerCase()))].filter(Boolean)
     if (extensions.length === 0) {
       console.error(`[lsp] ${id} has no extensions and is not a known OpenCode server; it matches no files`)
       continue
