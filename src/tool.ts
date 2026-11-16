@@ -127,14 +127,24 @@ async function run(manager: LspManager, root: string, file: string, input: Input
       const lines = await manager.request(file, "callHierarchyProvider", async (client: LspClient) => {
         const items = await requestWithRetry(client, "textDocument/prepareCallHierarchy", { textDocument, position: at }, signal)
         if (!Array.isArray(items)) return []
+        if (items.length > 100) throw new Error("Call hierarchy returned more than 100 targets; choose a more specific position.")
         const method = incoming ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls"
-        const results = await Promise.all(items.map((item) => requestWithRetry(client, method, { item }, signal)))
-        // Outgoing call sites are in the prepared item's file, which may not be the requested one.
-        return results.flatMap((result, index) => {
-          const item = items[index]
-          const caller = typeof item?.uri === "string" && item.uri.startsWith("file:") ? fileURLToPath(item.uri) : file
-          return Array.isArray(result) ? result.flatMap((call) => formatCall(call, incoming, caller, root) ?? []) : []
-        })
+        const output: string[] = []
+        for (let offset = 0; offset < items.length; offset += 4) {
+          signal?.throwIfAborted()
+          const batch = items.slice(offset, offset + 4)
+          const results = await Promise.all(batch.map((item) => requestWithRetry(client, method, { item }, signal)))
+          // Outgoing call sites belong to the prepared item's file, not necessarily the requested file.
+          for (const [index, result] of results.entries()) {
+            const item = batch[index]
+            const caller = typeof item?.uri === "string" && item.uri.startsWith("file:") ? fileURLToPath(item.uri) : file
+            if (Array.isArray(result)) for (const call of result) {
+              const formatted = formatCall(call, incoming, caller, root)
+              if (formatted) output.push(formatted)
+            }
+          }
+        }
+        return output
       }, signal)
       return list(lines as string[])
     }

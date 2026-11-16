@@ -100,6 +100,9 @@ export class LspClient {
   #pending = new Map<number, Pending>()
   #capabilities: Record<string, any> = {}
   #stopping = false
+  #outgoing: { frame: string; bytes: number }[] = []
+  #queuedBytes = 0
+  #writeBlocked = false
 
   constructor(options: ClientOptions) {
     this.id = options.id
@@ -134,6 +137,7 @@ export class LspClient {
     child.on("exit", (code, signal) => this.#onExit(code, signal))
     // A server that exits while a notification is being written raises EPIPE.
     child.stdin?.on("error", () => {})
+    child.stdin?.on("drain", () => this.#flush())
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve())
       child.once("error", (error) => reject(new Error(`${this.id}: cannot start "${command}": ${error.message}`)))
@@ -245,14 +249,43 @@ export class LspClient {
 
   #send(message: Record<string, unknown>): void {
     const stdin = this.#child?.stdin
-    if (!stdin || stdin.destroyed) return
+    if (this.#failed || !stdin || stdin.destroyed) return
     const body = JSON.stringify(message)
-    stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`)
+    const length = Buffer.byteLength(body)
+    const header = `Content-Length: ${length}\r\n\r\n`
+    const bytes = header.length + length
+    if (length > MAX_BODY || this.#queuedBytes + stdin.writableLength + bytes > MAX_BODY + MAX_HEADER || this.#outgoing.length >= 256) {
+      this.#protocolError(new Error("outbound buffer exceeds limit"))
+      return
+    }
+    const frame = header + body
+    if (this.#writeBlocked) {
+      this.#outgoing.push({ frame, bytes })
+      this.#queuedBytes += bytes
+    } else {
+      this.#writeBlocked = !stdin.write(frame)
+    }
+  }
+
+  #flush(): void {
+    const stdin = this.#child?.stdin
+    if (this.#failed || !stdin || stdin.destroyed) return
+    this.#writeBlocked = false
+    while (this.#outgoing.length) {
+      const next = this.#outgoing.shift()!
+      this.#queuedBytes -= next.bytes
+      if (!stdin.write(next.frame)) {
+        this.#writeBlocked = true
+        break
+      }
+    }
   }
 
   #protocolError(error: unknown): void {
     const failure = new Error(`${this.id}: protocol error: ${errorMessage(error)}`)
     this.#failed = failure
+    this.#outgoing = []
+    this.#queuedBytes = 0
     this.#buffer = Buffer.alloc(0)
     this.#body = Buffer.alloc(0)
     this.#bodyLength = undefined
@@ -371,6 +404,9 @@ export class LspClient {
 
   #onExit(code: number | null, signal: NodeJS.Signals | null): void {
     this.#child = undefined
+    this.#outgoing = []
+    this.#queuedBytes = 0
+    this.#writeBlocked = false
     this.#rejectPending(new Error(`${this.id}: server exited (${code ?? signal})`))
     if (!this.#stopping && this.#options.debug) console.error(`[lsp:${this.id}] exited (${code ?? signal})`)
     this.#options.onExit(this.#failed)

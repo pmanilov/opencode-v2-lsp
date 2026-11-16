@@ -26,9 +26,17 @@ export function afterTool(manager: LspManager, root: string, diagnostics: boolea
     if (event.status !== "completed") return
     if (event.tool === "read") return warm(manager, root, event.input)
     if (!MUTATING_TOOLS.has(event.tool)) return
-    const { changed, deleted } = touchedFiles(event as Completed, root)
-    await Promise.all(deleted.map((file) => manager.close(file)))
-    if (diagnostics) await report(manager, root, event as Completed, changed)
+    try {
+      const { changed, deleted } = touchedFiles(event as Completed, root)
+      await Promise.all(deleted.map((file) => manager.close(file).catch(() => undefined)))
+      if (diagnostics) await report(manager, root, event as Completed, changed)
+      else {
+        const files = await checkable(manager, root, changed)
+        await Promise.all(files.map((file) => manager.sync(file).catch(() => undefined)))
+      }
+    } catch {
+      // Language-server failures must never turn a successful edit into a failed tool.
+    }
   }
 }
 
@@ -103,19 +111,16 @@ export function touchedFiles(event: Completed, root: string): { changed: string[
     const file = projectPath(root, value)
     if (!list.includes(file)) list.push(file)
   }
-  const output = event.result.output
-  if (isRecord(output)) {
-    // write: { target }; patch: { applied: [{ type, target }] }
-    add(changed, output.target)
-    if (Array.isArray(output.applied)) {
-      for (const item of output.applied) if (isRecord(item)) add(item.type === "delete" ? deleted : changed, item.target)
-    }
-    if (Array.isArray(output.files)) {
-      for (const item of output.files) if (isRecord(item)) add(item.status === "deleted" ? deleted : changed, item.file)
+  const files = event.result.metadata?.files
+  if ((event.tool === "patch" || event.tool === "apply_patch") && Array.isArray(files)) {
+    for (const item of files) {
+      if (!isRecord(item)) continue
+      if (item.status === "deleted") add(deleted, item.file)
+      else if (item.status === "added" || item.status === "modified") add(changed, item.file)
     }
   }
   if (isRecord(event.input)) {
-    add(changed, event.input.path)
+    if (event.tool === "write" || event.tool === "edit") add(changed, event.input.path)
     // A moved file's result names only its destination, so the source comes from the patch text.
     if (typeof event.input.patchText === "string") {
       for (const [, source] of event.input.patchText.matchAll(/^\*\*\* Update File: (.+?)\r?\n\*\*\* Move to: /gm)) {
