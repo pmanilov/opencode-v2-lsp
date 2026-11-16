@@ -23,14 +23,23 @@ export function errorsOnly(diagnostics: Diagnostic[]): Diagnostic[] {
 
 /** OpenCode 1's diagnostics block, errors only. Empty when there are none. */
 export function diagnosticsReport(file: string, diagnostics: Diagnostic[]): string {
-  const errors = errorsOnly(diagnostics)
-  if (errors.length === 0) return ""
-  const lines = errors.slice(0, MAX_ERRORS_PER_FILE).map((diagnostic) => {
+  return formatDiagnostics(file, errorsOnly(diagnostics), MAX_ERRORS_PER_FILE, false)
+}
+
+/** Explicit checks include all severities and source/code labels. */
+export function diagnosticListReport(file: string, diagnostics: Diagnostic[]): string {
+  return formatDiagnostics(file, diagnostics, 100, true)
+}
+
+function formatDiagnostics(file: string, diagnostics: Diagnostic[], limit: number, labels: boolean): string {
+  if (diagnostics.length === 0) return ""
+  const lines = diagnostics.slice(0, limit).map((diagnostic) => {
     const severity = SEVERITY[diagnostic.severity ?? 1] ?? "ERROR"
     const { line, character } = start(diagnostic.range)
-    return `${severity} [${line}:${character}] ${escapeDiagnostic(diagnostic.message)}`
+    const label = labels ? [diagnostic.source, diagnostic.code].filter((value) => value !== undefined).map((value) => escapeDiagnostic(String(value))).join(":") : ""
+    return `${severity} [${line}:${character}] ${label ? `[${label}] ` : ""}${escapeDiagnostic(diagnostic.message)}`
   })
-  const more = errors.length - MAX_ERRORS_PER_FILE
+  const more = diagnostics.length - limit
   if (more > 0) lines.push(`... and ${more} more`)
   return `<diagnostics file="${escapeDiagnostic(file)}">\n${lines.join("\n")}\n</diagnostics>`
 }

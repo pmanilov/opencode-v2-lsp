@@ -112,6 +112,8 @@ export interface FileDiagnostics {
   readonly file?: Diagnostic[]
   /** Other files whose diagnostics a server published while this file was checked. */
   readonly others: Map<string, Diagnostic[]>
+  /** Servers that did not supply a current report; an empty report is not a missing report. */
+  readonly unreported: string[]
 }
 
 /** A file's extension, or `.name` for an extensionless file such as `Dockerfile`. */
@@ -248,6 +250,40 @@ export class LspManager {
     return targets
   }
 
+  /** Inspect only the servers applicable to this file; never starts or syncs them. */
+  async status(file: string, signal?: AbortSignal) {
+    signal?.throwIfAborted()
+    const targets = await abortable(this.#targets(file), signal)
+    signal?.throwIfAborted()
+    return targets.map(({ key, server, root }) => {
+      const entry = this.#entries.get(key)
+      const error = entry?.client?.failure?.message ?? entry?.broken
+      const client = entry?.client
+      return {
+        id: server.id,
+        root,
+        state: this.#closed ? "stopped" : error ? "failed" : entry?.starting ? "starting" : entry?.client?.running ? "running" : "idle",
+        serverInfo: client?.serverInfo,
+        capabilities: Object.keys(client?.capabilities ?? {}).filter((key) => client?.capabilities[key]),
+        error,
+      }
+    })
+  }
+
+  /** Explicit checks propagate sync/startup failures rather than silently treating them as clean. */
+  async inspectDiagnostics(file: string, signal?: AbortSignal): Promise<FileDiagnostics> {
+    signal?.throwIfAborted()
+    if (this.serversFor(file).length === 0) throw new Error("No LSP server available for this file type.")
+    const targets = await abortable(this.#targets(file), signal)
+    if (targets.length === 0) throw new Error("No configured LSP server applies to this file's project.")
+    const synced = await this.sync(file, signal)
+    const missing = targets.filter((target) => !synced.some(({ client }) => client.id === target.key))
+    const reasons = missing.map((target) => `${target.key}: ${this.#entries.get(target.key)?.broken ?? "not running"}`)
+    if (synced.length === 0) throw new Error(`No LSP server for this file could start. ${reasons.join("; ")}`)
+    const report = await this.#reports(file, synced, this.#settings.diagnosticsTimeoutMs, signal)
+    return { ...report, unreported: [...report.unreported, ...reasons] }
+  }
+
   /** Run one document operation per file at a time, so versions reach servers in order. */
   #serialize<T>(uri: string, run: () => Promise<T>): Promise<T> {
     const result = (this.#queues.get(uri) ?? Promise.resolve()).then(run)
@@ -363,8 +399,12 @@ export class LspManager {
     // Reports from before this file's contents reached the server describe older contents.
     const reports = await Promise.all(synced.map(({ client, version, sentAt }) => this.#collect(client, uri, version, sentAt, timeoutMs, signal)))
     signal?.throwIfAborted()
-    const reported = reports.filter((report, index): report is Diagnostic[] =>
-      report !== undefined && report === this.#fresh(synced[index]!.client.id, uri)?.diagnostics)
+    const unreported: string[] = []
+    const reported = reports.filter((report, index): report is Diagnostic[] => {
+      const current = report !== undefined && report === this.#fresh(synced[index]!.client.id, uri)?.diagnostics
+      if (!current) unreported.push(synced[index]!.client.id)
+      return current
+    })
     const others = new Map<string, Diagnostic[]>()
     for (const { client, sentAt } of synced) {
       for (const [other, published] of this.#published.get(client.id) ?? []) {
@@ -372,7 +412,7 @@ export class LspManager {
         others.set(other, [...(others.get(other) ?? []), ...published.diagnostics])
       }
     }
-    return { file: reported.length ? reported.flat() : undefined, others }
+    return { file: reported.length ? reported.flat() : undefined, others, unreported }
   }
 
   async #collect(client: LspClient, uri: string, version: number, since: number, timeoutMs: number, signal?: AbortSignal): Promise<Diagnostic[] | undefined> {

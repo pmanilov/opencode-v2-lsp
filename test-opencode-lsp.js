@@ -34,10 +34,12 @@ const send = (message) => {
 }
 const diagnose = (text) =>
   text.split("\n").flatMap((line, index) => {
-    const severity = line.includes("ERROR") ? 1 : line.includes("WARN") ? 2 : line.includes("NOSEV") ? undefined : 0
+    const severity = line.includes("ERROR") ? 1 : line.includes("WARN") ? 2 : line.includes("NOSEV") ? undefined : line.includes("INFO") ? 3 : line.includes("HINT") ? 4 : 0
     if (severity === 0) return []
-    const character = line.search(/ERROR|WARN|NOSEV/)
-    return [{ range: { start: { line: index, character }, end: { line: index, character: character + 1 } }, severity, message: "bad " + index }]
+    const character = line.search(/ERROR|WARN|NOSEV|INFO|HINT/)
+    return [{ range: { start: { line: index, character }, end: { line: index, character: character + 1 } }, severity, message: "bad " + index,
+      ...(process.env.FAKE_LABELS ? { source: "fake", code: index % 2 ? String(index) : index } : {}),
+    }]
   })
 const changed = (uri, version, text) => {
   if (process.env.FAKE_BAD_DIAGNOSTICS) {
@@ -73,7 +75,7 @@ const handle = (message) => {
   }
   switch (method) {
     case "initialize": {
-      const result = { capabilities: {
+      const result = { serverInfo: { name: "Fake LSP", version: "1.2.3" }, capabilities: {
         textDocumentSync: process.env.FAKE_SYNC ? JSON.parse(process.env.FAKE_SYNC) : { openClose: true, change: 1, save: { includeText: false } },
         hoverProvider: true, definitionProvider: true, referencesProvider: true, documentSymbolProvider: true,
         workspaceSymbolProvider: true, callHierarchyProvider: true,
@@ -539,6 +541,120 @@ test("the lsp tool runs OpenCode 1's operations with 1-based positions", async (
     await cleanup()
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test("explicit diagnostics filter all severities and labels through push and pull, even with automatic checks disabled", async () => {
+  for (const pull of ["0", "1"]) {
+    const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], env: { FAKE_PULL: pull, FAKE_LABELS: "1" } } })
+    const { lsp, cleanup } = await start(root, { diagnostics: false })
+    try {
+      const file = join(root, "check.ts")
+      await writeFile(file, "ERROR\nWARN\nNOSEV\nINFO\nHINT\n")
+      const run = async (filters = {}) => (await lsp.execute({ operation: "diagnostics", path: "check.ts", ...filters })).content
+      const all = await run()
+      assert.match(all, /ERROR \[1:1\] \[fake:0\] bad 0/)
+      assert.match(all, /WARN \[2:1\] \[fake:1\] bad 1/)
+      assert.match(all, /ERROR \[3:1\] \[fake:2\] bad 2/)
+      assert.match(all, /INFO \[4:1\] \[fake:3\] bad 3/)
+      assert.match(all, /HINT \[5:1\] \[fake:4\] bad 4/)
+      assert.doesNotMatch(all, /Incomplete/)
+      const warnings = await run({ severity: "warning", source: "fake", code: 1 })
+      assert.match(warnings, /WARN \[2:1\]/)
+      assert.doesNotMatch(warnings, /ERROR|INFO|HINT/)
+      assert.match(await run({ code: "0" }), /ERROR \[1:1\]/)
+      assert.doesNotMatch(await run({ code: "0" }), /bad [1-4]/)
+      assert.match(await run({ source: "other" }), /No matching diagnostics/)
+      assert.match(await run({ severity: "hint" }), /HINT \[5:1\]/)
+      await writeFile(file, "fine\n")
+      assert.equal(await run(), "No matching diagnostics in current reports.", "a fresh clean report must replace old errors")
+      await writeFile(join(root, "unsupported.txt"), "ERROR\n")
+      await assert.rejects(lsp.execute({ operation: "diagnostics", path: "unsupported.txt" }), /No LSP server available/)
+      await assert.rejects(lsp.execute({ operation: "diagnostics", path: "../outside.ts" }), /outside the project/)
+    } finally {
+      await cleanup()
+      await rm(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test("explicit diagnostics distinguish silent and failed servers from a complete clean check", async () => {
+  const root = await project({
+    fake: { command: ["FAKE"], extensions: [".ts"] },
+    broken: { command: ["/nonexistent/lsp-binary"], extensions: [".ts"] },
+  })
+  const { lsp, cleanup } = await start(root, { diagnosticsTimeoutMs: 100 })
+  try {
+    await writeFile(join(root, "check.ts"), "SILENT\n")
+    const run = async () => (await lsp.execute({ operation: "diagnostics", path: "check.ts" })).content
+    const silent = await run()
+    assert.match(silent, /Diagnostics unavailable/)
+    assert.match(silent, /Incomplete check; no current report from: fake; broken: .*cannot start/)
+    assert.doesNotMatch(silent, /No matching diagnostics/)
+    await writeFile(join(root, "check.ts"), "fine\n")
+    const partial = await run()
+    assert.match(partial, /No matching diagnostics in current reports/)
+    assert.match(partial, /Incomplete check; no current report from: broken:/)
+    await writeFile(join(root, "check.ts"), "ERROR\n")
+    assert.match(await run(), /ERROR \[1:1\] bad 0/)
+    const failed = JSON.parse((await lsp.execute({ operation: "status", path: "check.ts" })).content).find((server) => server.id === "broken")
+    assert.equal(failed.state, "failed")
+    assert.match(failed.error, /cannot start/)
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+  const brokenRoot = await project({ broken: { command: ["/nonexistent/lsp-binary"], extensions: [".ts"] } })
+  const broken = await start(brokenRoot)
+  try {
+    await writeFile(join(brokenRoot, "check.ts"), "ERROR\n")
+    await assert.rejects(broken.lsp.execute({ operation: "diagnostics", path: "check.ts" }), /could start\. broken: .*cannot start/)
+  } finally {
+    await broken.cleanup()
+    await rm(brokenRoot, { recursive: true, force: true })
+  }
+})
+
+test("status observes per-root startup and capabilities without starting or synchronizing servers", async () => {
+  const root = await project({ pyright: { command: ["FAKE"], env: { FAKE_INIT_DELAY: "300", FAKE_LOG: "requests.log" } } })
+  const { lsp, cleanup } = await start(root)
+  try {
+    await mkdir(join(root, "svc"))
+    await writeFile(join(root, "svc", "pyproject.toml"), "")
+    await writeFile(join(root, "svc", "app.py"), "fine\n")
+    await writeFile(join(root, "top.py"), "fine\n")
+    const status = async (path = "svc/app.py") => JSON.parse((await lsp.execute({ operation: "status", path })).content)[0]
+    assert.equal((await status()).state, "idle")
+    await assert.rejects(readFile(join(root, "svc", "requests.log")), { code: "ENOENT" }, "status must not spawn a server")
+    const pending = lsp.execute({ operation: "diagnostics", path: "svc/app.py" })
+    await waitForLog(join(root, "svc", "requests.log"), "initialize")
+    assert.equal((await status()).state, "starting")
+    await pending
+    const running = await status()
+    assert.equal(running.state, "running")
+    assert.equal(running.root, "svc")
+    assert.deepEqual(running.serverInfo, { name: "Fake LSP", version: "1.2.3" })
+    assert.ok(running.capabilities.includes("hoverProvider"))
+    assert.equal((await status("top.py")).state, "idle", "a different detected root must not reuse this server's state")
+    const before = await readFile(join(root, "svc", "requests.log"), "utf8")
+    await writeFile(join(root, "svc", "app.py"), "ERROR\n")
+    await status()
+    assert.equal(await readFile(join(root, "svc", "requests.log"), "utf8"), before, "status must not send changed contents")
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("explicit diagnostic output bounds all severities and escapes source and code labels", async () => {
+  const { diagnosticListReport } = await import(new URL("src/format.ts", PLUGIN))
+  const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }
+  const output = diagnosticListReport('a"><fake>.ts', Array.from({ length: 101 }, () => ({
+    range, severity: 2, source: "</diagnostics>", code: "<code>", message: "<message>",
+  })))
+  assert.match(output, /file="a&quot;&gt;&lt;fake&gt;\.ts"/)
+  assert.match(output, /\[&lt;\/diagnostics&gt;:&lt;code&gt;\] &lt;message&gt;/)
+  assert.match(output, /\.\.\. and 1 more/)
+  assert.equal((output.match(/^WARN /gm) ?? []).length, 100)
 })
 
 test("builtin server IDs run at OpenCode 1's per-server roots; custom IDs run at the project", async () => {

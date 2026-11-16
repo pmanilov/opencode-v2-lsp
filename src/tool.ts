@@ -2,6 +2,7 @@ import { realpath, stat } from "node:fs/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import type { LspClient } from "./client.ts"
 import {
+  diagnosticListReport,
   displayPath,
   formatCall,
   formatCallItem,
@@ -22,6 +23,8 @@ const OPERATIONS = [
   "prepareCallHierarchy",
   "incomingCalls",
   "outgoingCalls",
+  "diagnostics",
+  "status",
 ] as const
 
 type Operation = (typeof OPERATIONS)[number]
@@ -32,6 +35,9 @@ interface Input {
   line?: number
   character?: number
   query?: string
+  severity?: "error" | "warning" | "information" | "hint"
+  source?: string
+  code?: string | number
 }
 
 const DESCRIPTION = `Interact with Language Server Protocol (LSP) servers to get code intelligence features.
@@ -46,12 +52,15 @@ Supported operations:
 - prepareCallHierarchy: Get call hierarchy item at a position (functions/methods)
 - incomingCalls: Find all functions/methods that call the function at a position
 - outgoingCalls: Find all functions/methods called by the function at a position
+- diagnostics: Check current file diagnostics, including warnings, information, and hints
+- status: Inspect applicable servers without starting them (state, root, server info, capabilities, last failure)
 
-Every operation needs path. All except documentSymbol and workspaceSymbol also need line and character (1-based, as shown in editors).
+Every operation needs path. All except documentSymbol, workspaceSymbol, diagnostics, and status also need line and character (1-based, as shown in editors).
 
 workspaceSymbol also accepts query, a string to filter symbols by; an empty string requests all symbols. Its path only selects which language server to ask.
+diagnostics accepts optional severity (error, warning, information, hint), source, and code filters. Source and code match exactly; numeric and string codes with the same text match. A missing report is not a clean result. Checks may start servers even when automatic diagnostics are disabled.
 
-Results use 1-based path:line:character locations relative to the project. LSP servers must be configured for the file type; if none is available, an error is returned.`
+Results use 1-based positions relative to the project. Navigation and diagnostic checks require an applicable configured server; status can report that none applies.`
 
 /** The OpenCode 1 `lsp` tool, with V2's `path` argument name. */
 export function lspTool(manager: LspManager, root: string) {
@@ -66,6 +75,9 @@ export function lspTool(manager: LspManager, root: string) {
         line: { type: "integer", minimum: 1, description: "The line number (1-based, as shown in editors)" },
         character: { type: "integer", minimum: 1, description: "The character offset (1-based, as shown in editors)" },
         query: { type: "string", description: "Search query for workspaceSymbol. Empty string requests all symbols." },
+        severity: { type: "string", enum: ["error", "warning", "information", "hint"], description: "Exact severity filter for diagnostics; omitted means all severities" },
+        source: { type: "string", description: "Exact diagnostic source filter" },
+        code: { type: ["string", "number"], description: "Exact diagnostic code filter (compared as text)" },
       },
       required: ["operation", "path"],
       additionalProperties: false,
@@ -96,6 +108,24 @@ async function run(manager: LspManager, root: string, file: string, input: Input
   const list = (lines: string[]) => lines.join("\n")
 
   switch (input.operation) {
+    case "status": {
+      const statuses = await manager.status(file, signal)
+      if (statuses.length === 0) return "No configured LSP server applies to this file."
+      return JSON.stringify(statuses.map((status) => ({ ...status, root: status.root === root ? "." : displayPath(status.root, root) })), null, 2)
+    }
+    case "diagnostics": {
+      const report = await manager.inspectDiagnostics(file, signal)
+      const severities = { error: 1, warning: 2, information: 3, hint: 4 }
+      const diagnostics = report.file?.filter((diagnostic) =>
+        (input.severity === undefined || (diagnostic.severity ?? 1) === severities[input.severity]) &&
+        (input.source === undefined || diagnostic.source === input.source) &&
+        (input.code === undefined || (diagnostic.code !== undefined && String(diagnostic.code) === String(input.code))),
+      )
+      const output = diagnostics?.length
+        ? diagnosticListReport(displayPath(file, root), diagnostics)
+        : report.file === undefined ? "Diagnostics unavailable: no current report received." : "No matching diagnostics in current reports."
+      return report.unreported.length ? `${output}\nIncomplete check; no current report from: ${report.unreported.join("; ")}` : output
+    }
     case "goToDefinition":
       return list(formatLocations(await ask("definitionProvider", "textDocument/definition", { textDocument, position: position() }), root))
     case "goToImplementation":
