@@ -45,6 +45,7 @@ See [examples/opencode.jsonc](examples/opencode.jsonc) for portable Python, Type
 ## Features
 
 - Adds an `lsp` tool for definitions, references, hover, document/workspace symbols, implementations, and call hierarchies.
+- Adds explicit file diagnostics with severity/source/code filters, plus server status inspection without starting servers.
 - Appends error diagnostics to successful `write`, `edit`, `patch`, and `apply_patch` results, with diagnostic metadata for the terminal UI.
 - Supports push and pull diagnostics, document versions, and fresh errors reported in other files.
 - Starts servers lazily and warms them on file reads; uses one server process per server ID and detected root.
@@ -55,7 +56,7 @@ See [examples/opencode.jsonc](examples/opencode.jsonc) for portable Python, Type
 
 ### Tool inputs
 
-Every operation requires `path`. Positions are **1-based**, with UTF-16 character offsets. All operations except `documentSymbol` and `workspaceSymbol` also require `line` and `character`.
+Every operation requires `path`. Positions are **1-based**, with UTF-16 character offsets. All operations except `documentSymbol`, `workspaceSymbol`, `diagnostics`, and `status` also require `line` and `character`.
 
 ```json
 {"operation": "goToDefinition", "path": "src/app.py", "line": 12, "character": 5}
@@ -65,7 +66,29 @@ Every operation requires `path`. Positions are **1-based**, with UTF-16 characte
 {"operation": "workspaceSymbol", "path": "src/app.py", "query": "Handler"}
 ```
 
-The supported operation names are `goToDefinition`, `findReferences`, `hover`, `documentSymbol`, `workspaceSymbol`, `goToImplementation`, `prepareCallHierarchy`, `incomingCalls`, and `outgoingCalls`. For `workspaceSymbol`, the path selects the server; an empty query requests all symbols. Each operation depends on the server advertising the corresponding capability.
+The supported operation names are `goToDefinition`, `findReferences`, `hover`, `documentSymbol`, `workspaceSymbol`, `goToImplementation`, `prepareCallHierarchy`, `incomingCalls`, `outgoingCalls`, `diagnostics`, and `status`. For `workspaceSymbol`, the path selects the server; an empty query requests all symbols. Navigation operations depend on the server advertising the corresponding capability.
+
+### Explicit diagnostics and server status
+
+```json
+{"operation": "diagnostics", "path": "src/app.py"}
+```
+
+Checks the file's current disk contents using push or pull diagnostics. Includes errors, warnings, information, and hints; missing severity is treated as an error. Optional filters are combined:
+
+```json
+{"operation": "diagnostics", "path": "src/app.py", "severity": "warning", "source": "Pyright", "code": "reportUnusedImport"}
+```
+
+`severity` accepts `error`, `warning`, `information`, or `hint`. `source` and `code` match exactly; numeric and string codes with the same text match. Use source/code values emitted by your server. Output includes source and code labels, is escaped like post-edit diagnostics, and is capped at 100 matching diagnostics with an omission notice.
+
+Explicit checks may start servers and use `diagnosticsTimeoutMs`. They remain available with `diagnostics: false`. No applicable server, sync failures, or failure of every applicable server to start produces an error. A timeout without a current report is **not** reported as clean. Partial checks identify servers that failed to start or did not provide a current report, including when other servers report no matching diagnostics. This checks one file, not the entire workspace.
+
+```json
+{"operation": "status", "path": "src/app.py"}
+```
+
+Returns JSON for servers applicable to that file and its detected project roots: server ID, root, state (`idle`, `starting`, `running`, `failed`, or `stopped`), advertised capability names, server name/version when supplied, and the last failure when available. Does not start servers, synchronize file contents, or wait for initialization. `running` means the process has initialized, not that indexing has finished. Paths still must identify existing files inside the project; an unsupported file returns a message that no configured server applies.
 
 ## Configuration
 
@@ -96,13 +119,13 @@ Optional settings use OpenCode's object-form plugin entry:
 }
 ```
 
-The values shown are the defaults. `diagnostics: false` disables post-edit reporting but still synchronizes edits for navigation. Unchanged contents are not resent to already-synchronized servers. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
+The values shown are the defaults. `diagnostics: false` disables automatic post-edit reporting but still synchronizes edits for navigation; explicit `diagnostics` checks remain available. Unchanged contents are not resent to already-synchronized servers. `options.lsp` overrides server settings; `lsp: false` disables all servers. Without any enabled, configured servers, the plugin registers neither the tool nor the diagnostic hook. Reload the plugin after changing its settings.
 
 ## Limitations and trust
 
-- Targets the OpenCode V2 plugin API (`ctx.tool.transform` and `ctx.tool.hook("execute.after", ...)`), not V1. Patch tracking uses OpenCode **2.3.0**'s `result.metadata.files` contract. Loading and hover have been smoke-checked in 2.3.0 with a fake stdio server; real language servers still require project-specific checks.
+- Targets the OpenCode V2 plugin API (`ctx.tool.transform` and `ctx.tool.hook("execute.after", ...)`), not V1. Patch tracking uses OpenCode **2.3.0**'s `result.metadata.files` contract. Loading, hover, explicit diagnostics, and status have been smoke-checked in 2.3.0 with fake stdio servers; real language servers still require project-specific checks.
 - Language servers must already be installed and support stdio. No automatic installation, TCP transport, or full editor functionality is provided.
-- Only errors are appended to tool results; warnings and hints are omitted. Missing diagnostic severity is treated as an error. Reports are capped at 20 errors per file and five other files; workspace symbol results are capped at 20.
+- Only errors are appended to edit results; warnings and hints are omitted there. Explicit `diagnostics` checks include all severities. Missing diagnostic severity is treated as an error. Post-edit reports are capped at 20 errors per file and five other files; explicit checks at 100 matching diagnostics; workspace symbol results at 20.
 - Diagnostic retention is bounded per server to 128 recently received URI reports, each at most 256 KiB and 1,024 diagnostics. Messages are limited to 16 KiB and source/string-code fields to 1 KiB. A visible notice accounts for omitted diagnostics or shortened text; older URI reports may be evicted.
 - Call-hierarchy follow-ups run at most four requests concurrently per server. More than 100 prepared targets fails with an explicit error rather than issuing an unbounded request fan-out.
 - Diagnostics are best-effort. A silent or failed server leaves the edit result unchanged; a navigation request explains a startup failure. A server that fails to start stays disabled for that plugin instance until it reloads.

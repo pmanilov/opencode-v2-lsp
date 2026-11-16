@@ -99,6 +99,7 @@ export class LspClient {
   #nextId = 1
   #pending = new Map<number, Pending>()
   #capabilities: Record<string, any> = {}
+  #serverInfo?: { readonly name: string; readonly version?: string }
   #stopping = false
   #outgoing: { frame: string; bytes: number }[] = []
   #queuedBytes = 0
@@ -111,6 +112,10 @@ export class LspClient {
 
   get capabilities(): Record<string, any> {
     return this.#capabilities
+  }
+
+  get serverInfo(): { readonly name: string; readonly version?: string } | undefined {
+    return this.#serverInfo
   }
 
   get failure(): Error | undefined {
@@ -171,6 +176,10 @@ export class LspClient {
       this.#options.initializeTimeoutMs,
     )
     this.#capabilities = record(record(result)?.capabilities) ?? {}
+    const info = record(record(result)?.serverInfo)
+    if (typeof info?.name === "string") {
+      this.#serverInfo = { name: info.name, ...(typeof info.version === "string" ? { version: info.version } : {}) }
+    }
     this.notify("initialized", {})
     if (this.#options.initialization) {
       this.notify("workspace/didChangeConfiguration", { settings: this.#options.initialization })
